@@ -1,5 +1,9 @@
 # jackettdedup
 
+> [!IMPORTANT]
+> Use the plugins and the websites they connect to at your own risk. \
+> You are personally responsible for following the copyright laws and other applicable laws in your country.
+
 TL;DR- A search plugin for qBittorrent. It merges Jackett's duplicate search results (the same torrent listed by several sites) into one row.
 
 ELI5- searching a torrent means checking across TPB, 1337x, BtDigg, etc. With qBittorrent's built-in Jackett plugin (setup guide below), all these sites are searched within qBittorrent itself and put in one list. But, if the same torrent was uploaded to five sites, you get five rows for the same thing. My plugin collapses these 5 results into one row and pools the sites' trackers into one link so you find more peers- this makes searching easier and your downloads faster. It also hides (can toggle off) torrents with matching title+size but different infohash with fewer seeders. These are different torrents that can't be merged (usually a re-upload with minor changes); the best-seeded one is kept and the rest are hidden behind a `+N alt` marker. [Details](#details) below.
@@ -75,7 +79,7 @@ macOS: `~/Library/Application Support/qBittorrent/nova3/engines/`;
 2. qBittorrent -> `Search` Tab -> `Search Plugins` -> right-click `Jackett` -> untick `Enabled`. Disable it, don't uninstall it.  
 3. `Search Plugins` -> `Install a new one` -> `Local File` -> Pick `jackettdedup.py`
 4. Search again. Results appear within about 20 seconds; slow sites add theirs after that. If you add more sites to Jackett (http://127.0.0.1:9117); these are picked up automatically.
-![Jackett disabled, JackettDedupe enabled](docs/images/5_jackettdedup enabled)
+![Jackett disabled, JackettDedupe enabled](docs/images/5_jackettdedup-enabled.png)
 
 ## Settings
 Everything is in `jackettdedup.json`, it's read at the start of every search, so edits need no restart. To tweak `(Win + R)`:
