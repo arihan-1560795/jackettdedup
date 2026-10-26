@@ -1,8 +1,16 @@
-# VERSION: 2.9
+#VERSION: 2.10
 # AUTHORS: Arihan Jalan
 # CREDITS: the parts that talk to Jackett and qBittorrent (API calls, category ids, error
-#          row, User-Agent, proxy handling) follow jackett.py 4.13 by Diego de las Heras
-#          (ngosang@hotmail.es) and contributors, GPL-2.0-or-later. The merging is new.
+#          row, User-Agent, proxy handling) follow jackett.py 4.14 by Diego de las Heras
+#          (ngosang@hotmail.es) and contributors, GPL-2.0. The merging is new.
+#
+# Copyright (C) 2026 Arihan Jalan
+#
+# This program is free software; you can redistribute it and/or modify it under the terms of
+# the GNU General Public License version 2 as published by the Free Software Foundation.
+# This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY;
+# without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+# See the GNU General Public License for more details: <https://www.gnu.org/licenses/>.
 #
 # qBittorrent search plugin for Jackett.
 #
@@ -85,7 +93,7 @@ from multiprocessing.dummy import Pool
 from threading import Lock
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qs, quote, unquote, urlencode
+from urllib.parse import parse_qs, quote, unquote, urlencode, urlsplit
 
 import helpers
 from novaprinter import prettyPrinter
@@ -115,7 +123,9 @@ _DEFAULTS: Dict[str, Any] = {
     # Jackett's API key (dashboard, top right).
     'api_key': 'YOUR_API_KEY_HERE',
 
-    # Jackett's address. Jackett on another machine: "http://192.168.1.10:9117".
+    # Jackett's address. Jackett on another machine: "http://192.168.1.10:9117". The one
+    # setting that needs a qBittorrent restart: qBittorrent remembers the plugin's address
+    # from its own start and matches result rows against it (README, Known limitations).
     'url': 'http://127.0.0.1:9117',
 
     # Sites searched at the same time. 1 = one combined request to Jackett, which answers
@@ -190,16 +200,19 @@ _DEFAULTS: Dict[str, Any] = {
     # never merged.
     'lookup_hashes': True,
 
-    # Lookups running at the same time on one site. 1-2 for sites behind Cloudflare or
-    # FlareSolverr, which refuse or queue parallel requests. Range 1-8.
+    # Lookups running at the same time on one site. 2 for sites behind Cloudflare or
+    # FlareSolverr, which refuse or queue parallel requests. At 2 or more, one slot is kept
+    # free for a likely duplicate that arrives late (see lookup_remaining_hashes); at 1
+    # nothing can be kept free, so such a row waits behind a second-round lookup. Range 1-8.
     'lookup_per_indexer': 4,
 
     # Round 2: after the likely duplicates, look up the hash of every other hash-less public
     # row too, while there is time before show_results_after. Likely duplicates always go
-    # first, and one of each site's lookup_per_indexer slots is kept free for them. This
-    # catches copies whose titles are too different to look alike (a DHT site's file name
-    # against a release name), and gives a row from a site that reports no seeders the seed
-    # count of the copy that does. Off = likely duplicates only.
+    # first, and one of each site's lookup_per_indexer slots is kept free for them (at 1
+    # there is nothing to keep free). This catches copies whose titles are too different to
+    # look alike (a DHT site's file name against a release name), and gives a row from a
+    # site that reports no seeders the seed count of the copy that does. Off = likely
+    # duplicates only.
     'lookup_remaining_hashes': True,
 
     # Share of title words two rows must have in common: shared words / all words, 0-1.
@@ -212,13 +225,15 @@ _DEFAULTS: Dict[str, Any] = {
 
     # ---- sizes, for lookups and folding ----------------------------------------------
     # Two sizes count as the same when they differ by at most size_tolerance of the larger
-    # one, or by at most size_tolerance_mb, whichever allows more.
+    # one, or, when the larger one is at least 1 GiB, by at most size_tolerance_mb,
+    # whichever allows more. Below 1 GiB the fraction alone decides: there the MB floor
+    # would be far more than display rounding (700 MB and 800 MB are different files).
 
     # The fraction. Range 0.01-0.10.
     'size_tolerance': 0.05,
 
-    # The MB floor. Sites round differently, so "1.2 GB" on one and "1.1 GB" on another
-    # can be the same file. 0 = fraction only. Range 0-200.
+    # The MB floor, for sizes of 1 GiB and more. Sites round differently, so "1.2 GB" on
+    # one and "1.1 GB" on another can be the same file. 0 = fraction only. Range 0-200.
     'size_tolerance_mb': 110,
 
     # ---- lookalike folding -----------------------------------------------------------
@@ -266,8 +281,9 @@ _OFFICIAL_KEYS = {
 }
 
 
-# Loads jackettdedup.json into _SETTINGS. Runs once, when qBittorrent imports the plugin
-# (at install and at every start of qBittorrent).
+# Loads jackettdedup.json into _SETTINGS. Runs when qBittorrent imports the plugin: at
+# install, at its own start, and at every search and download, each a new Python process,
+# which is why edits to the file apply at the next search.
 #   1. The file exists: read it. Unreadable, or not JSON = every search shows an error row.
 #   2. It does not exist (first run): start from the official plugin's jackett.json, if any.
 #   3. Add every setting the file lacks with its default, drop settings this version no
@@ -361,22 +377,36 @@ _load_settings()
 # The infohash is the SHA-1 of the bytes of the top-level `info` value exactly as they are
 # in the file, so the helpers below locate those bytes instead of decoding and re-encoding
 # them: re-encoding could change a byte, and with it the hash.
+#
+# That is the BitTorrent v1 infohash, the one sites, Jackett and nearly every torrent use.
+# BitTorrent v2 (2020) identifies a torrent by the SHA-256 of the same `info` bytes
+# instead, written in a magnet as urn:btmh:1220<64 hex chars> (1220 = "SHA-256, 32
+# bytes"). A "hybrid" torrent carries both layouts and keeps its v1 hash as the key here.
+# A v2-only torrent (`meta version` 2 in info, no `pieces`) has no v1 hash at all; its key
+# is "v2:" + the 64 hex chars, so it merges with other v2-only copies and never collides
+# with a v1 key. Such torrents are rare on public sites, which index by v1 hash.
 
 # the hash inside a magnet link: the 32 or 40 chars after urn:btih:
 _BTIH_RE = re.compile(r'urn:btih:([0-9a-z]{32,40})', re.IGNORECASE)
-# a hash already written as 40 hex chars
+# the v2 hash inside a magnet link: the 64 hex chars after urn:btmh:1220
+_BTMH_RE = re.compile(r'urn:btmh:1220([0-9a-f]{64})', re.IGNORECASE)
+# a hash already written as 40 hex chars (v1) or 64 (v2)
 _HEX40_RE = re.compile(r'^[0-9a-f]{40}$')
+_HEX64_RE = re.compile(r'^[0-9a-f]{64}$')
 
 
-# Converts a hash to the one form rows are grouped by: 40 lowercase hex chars. Sites write
-# the same hash as hex in either case or as 32 base32 chars, and only one spelling can be
-# the key.
-#   returns: the hash, or None when raw is not a hash at all
+# Converts a hash to the one form rows are grouped by: 40 lowercase hex chars for a v1
+# hash, "v2:" + 64 lowercase hex chars for a v2 one. Sites write the same v1 hash as hex in
+# either case or as 32 base32 chars, and only one spelling can be the key.
+#   returns: the key, or None when raw is not a hash at all
 def _normalize_hash(raw: str) -> Optional[str]:
     raw = raw.strip().lower()
     # already 40 hex chars: done
     if _HEX40_RE.match(raw):
         return raw
+    # 64 hex chars: a v2 hash
+    if _HEX64_RE.match(raw):
+        return 'v2:' + raw
     # 32 chars: base32, decode it to hex
     if len(raw) == 32:
         try:
@@ -387,11 +417,17 @@ def _normalize_hash(raw: str) -> Optional[str]:
     return None
 
 
-# Parses a magnet link for the torrent's infohash.
-#   returns: the hash, or None when link is not a magnet or has no usable urn:btih part
+# Parses a magnet link for the torrent's infohash: the v1 hash (urn:btih) when there is
+# one, else the v2 hash (urn:btmh) of a v2-only torrent.
+#   returns: the key, or None when link is not a magnet or has neither part
 def _hash_from_magnet(link: str) -> Optional[str]:
-    match = _BTIH_RE.search(link) if link.lower().startswith('magnet:') else None
-    return _normalize_hash(match.group(1)) if match else None
+    if not link.lower().startswith('magnet:'):
+        return None
+    match = _BTIH_RE.search(link)
+    if match:
+        return _normalize_hash(match.group(1))
+    match = _BTMH_RE.search(link)
+    return 'v2:' + match.group(1).lower() if match else None
 
 
 # Finds where one bencoded value ends without decoding it. _hash_from_torrent walks the
@@ -477,28 +513,48 @@ def _bencode_value(data: bytes, position: int) -> Tuple[Any, int]:
     raise ValueError('not bencode')
 
 
-# Computes the infohash of a .torrent file: the SHA-1 of the raw bytes of its `info` value.
-#   returns: the hash, or None when data is not a torrent (an HTML error page, say)
-def _hash_from_torrent(data: bytes) -> Optional[str]:
+# Finds the raw bytes of a .torrent file's `info` value, the bytes its infohash is computed
+# from (see the section comment above).
+#   returns: the bytes, or None when data is not a torrent (an HTML error page, say)
+def _info_bytes(data: bytes) -> Optional[bytes]:
     # a .torrent is one dict; anything else is not a torrent
     if data[:1] != b'd':
         return None
     try:
         # walk the top-level dict one key, value pair at a time without decoding the
-        # values, until the key is `info`: that value's bytes are what gets hashed
+        # values, until the key is `info`
         position = 1
         while data[position:position + 1] != b'e':
             key_end = _bencode_end(data, position)
             key = data[data.index(b':', position) + 1:key_end]
             value_end = _bencode_end(data, key_end)
             if key == b'info':
-                return hashlib.sha1(data[key_end:value_end]).hexdigest()
+                return data[key_end:value_end]
             position = value_end
     # the bytes stopped being bencode part-way: cut short, or not a torrent
     except ValueError:
         return None
     # a dict without `info`: not a torrent either
     return None
+
+
+# Computes the key a .torrent file is merged by: the v1 infohash, the SHA-1 of its raw
+# `info` bytes, for a v1 or hybrid torrent; "v2:" + the SHA-256 of those bytes for a
+# v2-only torrent, which has no v1 hash.
+#   returns: the key, or None when data is not a torrent (an HTML error page, say)
+def _hash_from_torrent(data: bytes) -> Optional[str]:
+    info = _info_bytes(data)
+    if info is None:
+        return None
+    # v2-only: `meta version` 2 and no v1 `pieces`; a hybrid has both and keeps its v1 hash
+    try:
+        info_dict = _bencode_value(info, 0)[0]
+    # the info value is not a dict's worth of bencode: not a torrent
+    except (ValueError, TypeError):
+        return None
+    if isinstance(info_dict, dict) and info_dict.get(b'meta version') == 2 and b'pieces' not in info_dict:
+        return 'v2:' + hashlib.sha256(info).hexdigest()
+    return hashlib.sha1(info).hexdigest()
 
 
 # Decodes a .torrent file for the small values the plugin reads out of it: the trackers
@@ -579,11 +635,21 @@ def _word_overlap(words: Tuple[str, ...], other_words: Tuple[str, ...]) -> float
     return len(shared) / len(together) if together else 0.0
 
 
+# a gibibyte: the size from which display rounding is coarse enough for the MB floor
+_GIB = 1024 ** 3
+
+
 # Decides whether two sizes count as the same: within tolerance (a fraction of the larger
-# one) or within abs_tolerance bytes, whichever allows more. The bytes allowance covers
-# sites that round differently, "1.2 GB" on one and "1.1 GB" on another.
+# one) or, for sizes of a gibibyte and more, within abs_tolerance bytes, whichever allows
+# more. The bytes allowance covers sites that round differently, "1.2 GB" on one and
+# "1.1 GB" on another; below a gibibyte it would be far more than rounding (700 MB and
+# 800 MB are different files), so there the fraction alone decides.
 def _sizes_match(size: int, other_size: int, tolerance: float, abs_tolerance: int) -> bool:
-    return abs(size - other_size) <= max(tolerance * max(size, other_size), abs_tolerance)
+    larger = max(size, other_size)
+    allowance = tolerance * larger
+    if larger >= _GIB:
+        allowance = max(allowance, abs_tolerance)
+    return abs(size - other_size) <= allowance
 
 
 # Splits a magnet link into its query parameters.
@@ -646,9 +712,11 @@ _HTTP_PROXY = os.environ.get('http_proxy', '')
 _HTTPS_PROXY = os.environ.get('https_proxy', '')
 
 
-# Turns the proxy qBittorrent passed in on or off. Off while talking to Jackett, which is
-# usually on this machine; on while fetching a download for qBittorrent, as the official
-# plugin does it.
+# Turns the HTTP proxy qBittorrent passed in on or off. Off while talking to Jackett, which
+# is on this machine or the local network; on only for a download link on some other host,
+# as the official plugin does it (download_torrent). A SOCKS proxy cannot be toggled:
+# qBittorrent's helpers apply it to the whole process at import and (5.1) offer no switch,
+# so it stays whatever qBittorrent set, for the official plugin and this one alike.
 def _set_proxy(enabled: bool) -> None:
     if enabled:
         os.environ['http_proxy'], os.environ['https_proxy'] = _HTTP_PROXY, _HTTPS_PROXY
@@ -657,7 +725,7 @@ def _set_proxy(enabled: bool) -> None:
         os.environ.pop('https_proxy', None)
     try:
         helpers.enable_socks_proxy(enabled)
-    # an older qBittorrent has no enable_socks_proxy: nothing to toggle
+    # no such switch in this qBittorrent: nothing to toggle
     except AttributeError:
         pass
 
@@ -683,9 +751,15 @@ _SKIPPED = 'skipped'
 
 
 class jackettdedup:
-    # read by qBittorrent from the class, before any instance exists
+    # Read by qBittorrent from the class, before any instance exists. The url is the
+    # plugin's identity: qBittorrent matches every result row's engine_url against the url
+    # of each installed plugin, first match wins, enabled or not, and routes the row's
+    # .torrent downloads to that plugin. The official plugin's url is the Jackett address
+    # without a trailing slash, so this one keeps the slash: the two strings never match.
+    # Requests go to api_url, the address proper.
     name = 'Jackett (dedup)'
-    url = _setting('url').rstrip('/')
+    api_url = _setting('url').rstrip('/')
+    url = api_url + '/'
     # qBittorrent's category names -> Jackett's category ids
     supported_categories = {
         'all': None,
@@ -794,9 +868,12 @@ class jackettdedup:
             # the second lookup round ends when it is time for the first showing
             if first_shown_at is not None or elapsed >= cfg.show_results_after:
                 self._first_shown = True
+            # whether the sites have all answered is read before the lookups are sorted:
+            # read after, rows that arrived in between would count as done without a lookup
+            searches_done = searches.ready()
             if lookup_pool is not None:
                 self._start_lookups(lookup_pool)
-            done = searches.ready() and not self._lookups_pending()
+            done = searches_done and not self._lookups_pending()
             # the first showing, once it is time; every tick after that shows the late rows
             if first_shown_at is not None or done or elapsed >= cfg.show_results_after:
                 self._first_shown = True
@@ -822,7 +899,7 @@ class jackettdedup:
     #   returns: the site ids; [] after showing an error row when the list could not be had
     def _configured_indexers(self, query: str) -> List[str]:
         params = urlencode([('apikey', self.api_key), ('t', 'indexers'), ('configured', 'true')])
-        text, why = self._get_text(f"{self.url}/api/v2.0/indexers/all/results/torznab/api?{params}")
+        text, why = self._get_text(f"{self.api_url}/api/v2.0/indexers/all/results/torznab/api?{params}")
         # Jackett is not running, the url is wrong, or Jackett refused (a wrong API key
         # comes back as "HTTP 400: Invalid API Key")
         if text is None:
@@ -865,7 +942,7 @@ class jackettdedup:
         params = [('apikey', self.api_key), ('q', query)]
         if category is not None:
             params.append(('cat', ','.join(category)))
-        url = f"{self.url}/api/v2.0/indexers/{indexer_id}/results/torznab/api?{urlencode(params)}"
+        url = f"{self.api_url}/api/v2.0/indexers/{indexer_id}/results/torznab/api?{urlencode(params)}"
         # One attempt, then up to search_retries more when the site failed inside Jackett or
         # Jackett could not be reached: such failures often clear on the next try. No retry
         # for a rate limit (Jackett answers HTTP 429 and names a wait that is longer than
@@ -892,7 +969,7 @@ class jackettdedup:
             rows = [row for row in (self._row_from_item(item, indexer_id) for item in items) if row is not None]
         # anything unexpected in the reply (not XML, a field that is not a number...): one
         # error row for this site. A thread that raised would be lost silently.
-        except Exception as error:  # pylint: disable=broad-exception-caught # noqa: BLE001
+        except Exception as error:
             self._show_error(f"indexer '{indexer_id}' returned something unreadable ({type(error).__name__})", query)
             return
         with self._lock:
@@ -1001,16 +1078,20 @@ class jackettdedup:
         with self._lock:
             # Rows arrived since the last check: compare every NEW row against all rows, old
             # and new, because a row arriving late can be the twin of an early one. A
-            # second-round row still waiting is compared again, since a twin arriving now
-            # moves it to the first round. A row already on screen is left alone: it cannot
-            # change any more.
+            # second-round row is compared again, whether it is still waiting or its lookup
+            # is already running, since a twin arriving now moves it to the first round: it
+            # is then held until its hash is known instead of shown as it is at the first
+            # showing. A row already on screen is left alone: it cannot change any more.
             if self._rows_version != self._candidates_version:
                 self._sort_rows_by_size()
                 for row in self._rows:
-                    if row['shown'] or row['lookup_tier'] == 1 or row['state'] not in (_NEW, _QUEUED):
+                    if row['shown'] or row['lookup_tier'] == 1 or row['state'] not in (_NEW, _QUEUED, _PENDING):
                         continue
                     if self._looks_like_duplicate(row):
-                        row['state'], row['lookup_tier'] = _QUEUED, 1
+                        # a lookup already running keeps running; only the round changes
+                        if row['state'] == _NEW:
+                            row['state'] = _QUEUED
+                        row['lookup_tier'] = 1
                     elif row['state'] == _NEW and second_round_open:
                         row['state'], row['lookup_tier'] = _QUEUED, 2
                 self._candidates_version = self._rows_version
@@ -1235,17 +1316,19 @@ class jackettdedup:
             'seeds': max(row['seeds'] for row in rows),
             'leech': max(row['leech'] for row in rows),
             'desc_link': next((row['details_url'] for row in rows if row['details_url']), ''),
-            # qBittorrent finds the plugin to download with by this; it must stay the Jackett url
+            # qBittorrent finds the plugin to download with by this; it must equal the class url
             'engine_url': self.url,
             # the earliest upload
             'pub_date': min(pub_dates) if pub_dates else -1,
         }
-        return {'result': result, 'seeds': best['seeds'], 'size': size, 'private': best['private'], 'words': best['words']}
+        # private when any copy is: such a row is never folded and never hides another, even
+        # when its best-seeded copy is public
+        return {'result': result, 'seeds': best['seeds'], 'size': size, 'private': any(row['private'] for row in rows), 'words': best['words']}
 
     # Builds one magnet link for a group: the hash, the first display name, every copy's
     # trackers (from magnets and from looked-up .torrent files, deduped) and any other
     # magnet parameters, such as web seeds. More trackers = more peers found.
-    #   infohash: '' for a hash-less row
+    #   infohash: the group's key, a v1 hash or "v2:" + a v2 hash; '' for a hash-less row
     #   rows: the group, best-seeded first
     #   returns: the magnet; '' when no copy has one (a lone .torrent-resolved row keeps
     #            its .torrent link); the first magnet unchanged when the hash is unknown
@@ -1257,6 +1340,13 @@ class jackettdedup:
         if not infohash:
             return magnets[0]
         display_name, trackers, extras = '', [], []
+        # the hash is written once, below, in its own form: urn:btih for a v1 key, urn:btmh
+        # for a v2 key; that same part of each magnet is skipped in the extras loop, while
+        # a hybrid magnet's other hash part is kept
+        if infohash.startswith('v2:'):
+            own_xt, own_prefix = f"urn:btmh:1220{infohash[3:]}", 'urn:btmh:'
+        else:
+            own_xt, own_prefix = f"urn:btih:{infohash}", 'urn:btih:'
         # the trackers read from looked-up .torrent files first
         for row in rows:
             trackers += [tracker for tracker in row['trackers'] if tracker not in trackers]
@@ -1270,11 +1360,11 @@ class jackettdedup:
                 if param in ('dn', 'tr'):
                     continue
                 for value in values:
-                    if param == 'xt' and value.lower().startswith('urn:btih:'):
+                    if param == 'xt' and value.lower().startswith(own_prefix):
                         continue
                     if (param, value) not in extras:
                         extras.append((param, value))
-        parts = [f"magnet:?xt=urn:btih:{infohash}", f"&dn={quote(display_name or rows[0]['title'], safe='')}"]
+        parts = [f"magnet:?xt={own_xt}", f"&dn={quote(display_name or rows[0]['title'], safe='')}"]
         parts += [f"&tr={quote(tracker, safe='')}" for tracker in trackers]
         parts += [f"&{quote(param, safe='')}={quote(value, safe=':')}" for param, value in extras]
         return ''.join(parts)
@@ -1340,7 +1430,7 @@ class jackettdedup:
                     value = value.replace('|', '%7C')
             safe[key] = value
         with _PRINT_LOCK:
-            prettyPrinter(safe)  # type: ignore[arg-type]
+            prettyPrinter(safe)
 
     # Prints an error as a result row, where the user will see it, as the official plugin
     # does. The row's description link opens the official plugin's help page.
@@ -1433,13 +1523,11 @@ class jackettdedup:
     def _get_text(self, url: str) -> Tuple[Optional[str], str]:
         try:
             return self._http_get(url).decode('utf-8'), ''
-        # a 302 is the magnet case of _http_get; any other HTTP error is a failure
+        # any HTTP error is a failure here: the XML endpoints never redirect to a magnet
         except urllib.error.HTTPError as error:
-            if error.code == 302:
-                return error.url, ''
             return None, _jackett_error(error)
         # connection refused, timeout, bad certificate...: the caller shows an error row
-        except Exception:  # pylint: disable=broad-exception-caught # noqa: BLE001
+        except Exception:
             return None, 'connection error'
 
     # Fetches a Jackett download link and says what came back. Jackett answers with a
@@ -1459,7 +1547,7 @@ class jackettdedup:
             if raise_errors:
                 raise
             return ('error', None)
-        except Exception:  # pylint: disable=broad-exception-caught # noqa: BLE001
+        except Exception:
             if raise_errors:
                 raise
             return ('error', None)
@@ -1485,8 +1573,11 @@ class jackettdedup:
         if download_url.startswith('magnet:?'):
             print(download_url + " " + download_url)
             return
-        # downloads honour the proxy qBittorrent passed in, as in the official plugin
-        _set_proxy(True)
+        # The proxy qBittorrent passed in is used only for a link on some other host, as the
+        # official plugin does since 4.14. A Jackett link is on the Jackett host, this
+        # machine or the local network, which a proxy elsewhere cannot reach: it goes
+        # direct, like the searches.
+        _set_proxy(urlsplit(download_url).netloc != urlsplit(self.api_url).netloc)
         try:
             kind, payload = self._fetch_download_link(download_url, raise_errors=True)
         finally:

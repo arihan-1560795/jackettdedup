@@ -30,8 +30,15 @@ GiB = 1024 ** 3
 
 # ------------------------------------------------------- qBittorrent stand-ins
 # Two modules that only exist inside qBittorrent. prettyPrinter prints one '|'-joined
-# line per result and rejects a '|' inside a field other than the name, like the real
-# one; it also rejects a line break anywhere, which the real one would print as two rows.
+# line per result the way qBittorrent 5.1's novaprinter 1.52 does: a '|' in the name
+# becomes a space and the size is converted to bytes. It rejects a '|' inside any other
+# field, and a line break anywhere, which the real one would print as two rows. Every
+# row printed is also kept in PRINTED as (seconds since PRINTED_FROM, the row as printed),
+# which is what the search tests read.
+
+PRINTED = []
+PRINTED_FROM = time.monotonic()
+
 
 def _pretty_printer(result):
     for key, value in result.items():
@@ -41,8 +48,10 @@ def _pretty_printer(result):
         if '|' in str(result.get(key, '')):
             raise ValueError(f"unexpected delimiter in {key}")
     size = int(result['size'].split(' ')[0]) if isinstance(result['size'], str) else result['size']
-    print('|'.join([result['link'], urllib.parse.quote(result['name']), str(size), str(result['seeds']),
-                    str(result['leech']), result['engine_url'], result.get('desc_link', ''), str(result.get('pub_date', -1))]))
+    printed = dict(result, name=result['name'].replace('|', ' '), size=size)
+    PRINTED.append((time.monotonic() - PRINTED_FROM, printed))
+    print('|'.join([printed['link'], printed['name'], str(size), str(printed['seeds']),
+                    str(printed['leech']), printed['engine_url'], printed.get('desc_link', ''), str(printed.get('pub_date', -1))]))
 
 
 novaprinter = types.ModuleType('novaprinter')
@@ -81,6 +90,17 @@ MULTI_FILE_TORRENT = bencode({b'announce': b'udp://tr.example:6969',
                               b'info': {b'name': b'Pack', b'piece length': 262144, b'pieces': b'\x00' * 20,
                                         b'files': [{b'length': 10, b'path': [b'a.mkv']}, {b'length': 5, b'path': [b'b.srt']}]}})
 
+# A v2-only .torrent (BitTorrent v2): `meta version` 2, a `file tree`, no v1 `pieces`. Its
+# key is "v2:" + the SHA-256 of `info`. A hybrid carries both layouts and keeps the v1 key.
+V2_INFO = {b'meta version': 2, b'name': b'v2.only.mkv', b'piece length': 65536,
+           b'file tree': {b'v2.only.mkv': {b'': {b'length': 4321, b'pieces root': b'\x11' * 32}}}}
+V2_FILE = bencode({b'announce': b'udp://v2.example:1', b'info': V2_INFO, b'piece layers': {}})
+V2_KEY = 'v2:' + hashlib.sha256(bencode(V2_INFO)).hexdigest()
+HYBRID_INFO = {**TORRENT_INFO, b'meta version': 2,
+               b'file tree': {b'Some.File.mkv': {b'': {b'length': 123456, b'pieces root': b'\x22' * 32}}}}
+HYBRID_FILE = bencode({b'announce': b'udp://tr.example:6969', b'info': HYBRID_INFO})
+HYBRID_HASH = hashlib.sha1(bencode(HYBRID_INFO)).hexdigest()
+
 
 # Makes a distinct, repeatable infohash from a short name, so fixtures can refer to hashes by name.
 def fake_hash(name):
@@ -95,6 +115,7 @@ def fake_hash(name):
 #   ('magnet', hash)          302 to a magnet with that hash and one tracker
 #   ('torrent', bytes)        the bytes, as a .torrent file
 #   ('html',)                 500 with an HTML body, as Jackett does when a site fails
+#   ('page',)                 200 with an HTML body, a site's error page passed through
 #   ('sleep', seconds, hash)  wait, then the magnet reply
 # A site's search can be made to fail the way a real Jackett reports a broken site: HTTP
 # 400 (or 429 for a rate-limited site) with an <error code="900"> body.
@@ -180,6 +201,11 @@ class FakeJackett:
                         self.send_header('Content-Type', 'application/x-bittorrent')
                         self.end_headers()
                         self.wfile.write(reply[1])
+                    elif reply[0] == 'page':
+                        self.send_response(200)
+                        self.send_header('Content-Type', 'text/html')
+                        self.end_headers()
+                        self.wfile.write(b'<html>The site answered with its error page</html>')
                     else:
                         self.send_response(500)
                         self.end_headers()
@@ -254,21 +280,20 @@ class SearchTest(unittest.TestCase):
 
     # Runs one search with short deadlines: first results at 2 s, stop at 8 s.
     #   settings: overrides for jackettdedup.json
-    #   returns: (rows as prettyPrinter got them, with 'name' unquoted and 'at' = seconds
-    #             after the start; seconds the search took)
+    #   returns: (rows as the stand-in printer printed them, each with 'at' = seconds after
+    #             the start; seconds the search took)
     def run_search(self, query='name 2018', **settings):
+        global PRINTED_FROM
         base = {'api_key': 'K', 'url': self.jackett.url, 'concurrent_searches': 8, 'show_results_after': 2, 'max_search_time': 8}
         base.update(settings)
         plugin = load_plugin(self.folder, base)
-        shown = []
-        real_printer = plugin.prettyPrinter
-        plugin.prettyPrinter = lambda result: (shown.append((time.monotonic() - started, dict(result))), real_printer(result))
-        started = time.monotonic()
-        # the stand-in printer still validates each row; its output is just not shown
+        PRINTED.clear()
+        PRINTED_FROM = time.monotonic()
+        # the stand-in printer validates and records each row; its output is just not shown
         with contextlib.redirect_stdout(io.StringIO()):
             plugin.jackettdedup().search(urllib.parse.quote(query), 'all')
-        rows = [dict(result, name=urllib.parse.unquote(result['name']), at=at) for at, result in shown]
-        return rows, time.monotonic() - started
+        rows = [dict(result, at=at) for at, result in PRINTED]
+        return rows, time.monotonic() - PRINTED_FROM
 
     # The tracker URLs in a shown row's magnet link.
     @staticmethod
@@ -292,21 +317,27 @@ class HashHelpers(unittest.TestCase):
         sys.modules.pop('jackettdedup', None)
         shutil.rmtree(self.folder, ignore_errors=True)
 
-    # Anything that is not a torrent, or is cut short, gives None, not an exception.
+    # Anything that is not a torrent, or is cut short, gives None, not an exception. A hybrid
+    # torrent keeps its v1 hash; a v2-only one gets its v2 key.
     def test_hash_from_torrent(self):
         self.assertEqual(self.plugin._hash_from_torrent(TORRENT_FILE), TORRENT_HASH)
         self.assertIsNone(self.plugin._hash_from_torrent(b'<html>nope</html>'))
         self.assertIsNone(self.plugin._hash_from_torrent(b'd4:infod1:ai1e'))
         self.assertIsNone(self.plugin._hash_from_torrent(b'd4:infod4:name5:ab'))
         self.assertIsNone(self.plugin._hash_from_torrent(bencode({b'zzz': 1})))
+        self.assertEqual(self.plugin._hash_from_torrent(HYBRID_FILE), HYBRID_HASH)
+        self.assertEqual(self.plugin._hash_from_torrent(V2_FILE), V2_KEY)
 
-    # Hex (any case) and base32 magnets give the same lowercase hex hash.
+    # Hex (any case) and base32 magnets give the same lowercase hex hash. A v2-only magnet
+    # gives the v2 key; a hybrid magnet, with both parts, the v1 hash.
     def test_hash_from_magnet(self):
         hex_hash = 'ab' * 20
         base32_hash = base64.b32encode(bytes.fromhex(hex_hash)).decode()
         self.assertEqual(self.plugin._hash_from_magnet(f'magnet:?xt=urn:btih:{hex_hash.upper()}'), hex_hash)
         self.assertEqual(self.plugin._hash_from_magnet(f'magnet:?xt=urn:btih:{base32_hash}&dn=x'), hex_hash)
         self.assertIsNone(self.plugin._hash_from_magnet('http://not.a.magnet'))
+        self.assertEqual(self.plugin._hash_from_magnet(f'magnet:?xt=urn:btmh:1220{V2_KEY[3:].upper()}&dn=x'), V2_KEY)
+        self.assertEqual(self.plugin._hash_from_magnet(f'magnet:?xt=urn:btih:{hex_hash}&xt=urn:btmh:1220{V2_KEY[3:]}'), hex_hash)
 
     # Site tags, brackets and punctuation vanish; words survive in lowercase, in order, in
     # any script.
@@ -345,8 +376,10 @@ class Settings(SearchTest):
             settings = json.load(settings_file)
         self.assertEqual((settings['api_key'], settings['concurrent_searches'], settings['indexers_before_title'], settings['show_results_after']),
                          ('SEEDED', 3, True, 20))
-        # the trailing slash is stripped
-        self.assertEqual(plugin.jackettdedup.url, self.jackett.url)
+        # requests go to the address without a trailing slash; the plugin identifies itself
+        # to qBittorrent with one, so its rows never match the official plugin's address
+        self.assertEqual(plugin.jackettdedup.api_url, self.jackett.url)
+        self.assertEqual(plugin.jackettdedup.url, self.jackett.url + '/')
 
     # A settings file from an older version: settings that no longer exist are dropped and
     # new ones added with their default; a quoted number still works as a number.
@@ -393,6 +426,13 @@ class Settings(SearchTest):
         self.jackett.search_delays['tpb'] = 30
         _, seconds = self.run_search(show_results_after=1, max_search_time=2)
         self.assertLess(seconds, 2.6)
+
+    # Jackett not running: one row saying so, at once.
+    def test_jackett_unreachable_shows_error_row(self):
+        rows, seconds = self.run_search(url='http://127.0.0.1:9')
+        self.assertEqual(len(rows), 1)
+        self.assertIn('could not get the indexer list from Jackett (connection error)', rows[0]['name'])
+        self.assertLess(seconds, 5.0)
 
 
 class SiteFailures(SearchTest):
@@ -456,12 +496,38 @@ class Downloads(SearchTest):
         os.remove(saved_path)
         self.assertEqual(self.jackett.requested_keys(), ['as-magnet', 'as-torrent', 'as-html'])
 
+    # Jackett answering a download link with a web page and status 200 (a site's own error
+    # page passed through) raises instead of saving the page as a .torrent.
+    def test_download_of_error_page_raises(self):
+        self.jackett.download_replies = {'as-page': ('page',)}
+        plugin = load_plugin(self.folder, {'api_key': 'K', 'url': self.jackett.url})
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(ValueError):
+                plugin.jackettdedup().download_torrent(f'{self.jackett.url}/dl/x/?path=as-page')
+
+    # A download of a Jackett link goes direct even when qBittorrent passed an HTTP proxy
+    # in: the link is on the Jackett host, which a proxy elsewhere cannot reach. The proxy
+    # here is a dead port, so going through it would fail.
+    def test_download_ignores_proxy_for_jackett_links(self):
+        self.jackett.download_replies = {'as-magnet': ('magnet', 'a' * 40)}
+        os.environ['http_proxy'] = os.environ['https_proxy'] = 'http://127.0.0.1:9'
+        try:
+            plugin = load_plugin(self.folder, {'api_key': 'K', 'url': self.jackett.url})
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                plugin.jackettdedup().download_torrent(f'{self.jackett.url}/dl/x/?path=as-magnet')
+        finally:
+            os.environ.pop('http_proxy', None)
+            os.environ.pop('https_proxy', None)
+        self.assertTrue(output.getvalue().startswith(f'magnet:?xt=urn:btih:{"a" * 40}'), output.getvalue())
+
 
 class HashMerging(SearchTest):
     # One torrent on three indexers (uppercase hash, lowercase hash, base32 magnet with no
     # hash attribute) becomes one row: top seed count, every tracker, the web seed, all three
-    # names. A '|' in a title is left to qBittorrent's printer; a line break and doubled
-    # spaces in a title are collapsed, so the row prints as one line.
+    # names. A '|' in a title is left to qBittorrent's printer, which shows it as a space
+    # (escaping it here too would show %7C); a line break and doubled spaces in a title are
+    # collapsed, so the row prints as one line. Every row names this plugin's identity
+    # address, the Jackett url with a trailing slash.
     def test_same_hash_becomes_one_row(self):
         infohash = 'a' * 40
         base32_hash = base64.b32encode(bytes.fromhex(infohash)).decode()
@@ -480,8 +546,9 @@ class HashMerging(SearchTest):
         self.assertTrue(merged['name'].startswith('Ubuntu 26.04 Desktop [TPB] [tpb, 1337x +1]'), merged['name'])
         self.assertEqual(self.trackers(merged), {'udp://a.example:1/announce', 'udp://b.example:1/announce', 'udp://c.example:1/announce'})
         self.assertIn('ws=', merged['link'])
-        self.assertTrue(any(row['name'].startswith('Pipe|in|title') for row in rows))
+        self.assertTrue(any(row['name'].startswith('Pipe in title') for row in rows))
         self.assertTrue(any(row['name'].startswith('Line one Line two [tpb]') for row in rows))
+        self.assertTrue(all(row['engine_url'] == self.jackett.url + '/' for row in rows))
 
     # When the best-seeded copy is on a semi-private tracker, the row links to its .torrent
     # (passkey) instead of a magnet.
@@ -492,6 +559,37 @@ class HashMerging(SearchTest):
         rows, _ = self.run_search()
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]['link'].startswith(self.jackett.url + '/dl/rutracker/'), rows[0]['link'])
+
+    # A private copy merged under a better-seeded public copy keeps the merged row private:
+    # it is never folded behind a lookalike and never hides one.
+    def test_private_copy_keeps_merged_row_unfolded(self):
+        infohash = 'd' * 40
+        other_hash = 'e' * 40
+        self.jackett.add_result('tpb', 'public', 'Name 2018 1080p WEB-DL', 900, 2 * GiB, infohash=infohash, magnet=f'magnet:?xt=urn:btih:{infohash}')
+        self.jackett.add_result('rutracker', 'semi-private', 'Name 2018 1080p WEB-DL', 10, 2 * GiB, infohash=infohash, magnet=f'magnet:?xt=urn:btih:{infohash}')
+        self.jackett.add_result('knaben', 'public', 'Name 2018 1080p WEB-DL', 500, 2 * GiB, infohash=other_hash, magnet=f'magnet:?xt=urn:btih:{other_hash}')
+        rows, _ = self.run_search()
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(any('+1 alt' in row['name'] for row in rows))
+
+    # A v2-only torrent (no v1 hash) on two indexers, one as a urn:btmh magnet and one as a
+    # .torrent reached by a lookup, becomes one row with a urn:btmh magnet carrying both
+    # sites' trackers. A hybrid .torrent reached by a lookup merges by its v1 hash as usual.
+    def test_v2_only_copies_merge(self):
+        v2_hex = V2_KEY[3:]
+        self.jackett.add_result('tpb', 'public', 'V2 Only Release 2026', 40, 4321, magnet=f'magnet:?xt=urn:btmh:1220{v2_hex}&tr=udp://a.example:1/announce')
+        self.jackett.download_replies = {'lime-v2': ('torrent', V2_FILE), 'lime-hybrid': ('torrent', HYBRID_FILE)}
+        self.jackett.add_result('lime', 'public', 'V2 Only Release 2026', 20, 4321, download_key='lime-v2', details_url='https://lime/v2')
+        self.jackett.add_result('tpb', 'public', 'Some File mkv', 50, TORRENT_SIZE, infohash=HYBRID_HASH, magnet=f'magnet:?xt=urn:btih:{HYBRID_HASH}')
+        self.jackett.add_result('lime', 'public', 'Some File mkv', 10, TORRENT_SIZE, download_key='lime-hybrid', details_url='https://lime/hybrid')
+        rows, _ = self.run_search(fold_lookalikes=False)
+        self.assertEqual(len(rows), 2)
+        v2_row = next(row for row in rows if 'btmh' in row['link'])
+        self.assertTrue(v2_row['link'].startswith(f'magnet:?xt=urn:btmh:1220{v2_hex}'), v2_row['link'])
+        self.assertIn('[tpb, lime]', v2_row['name'])
+        self.assertEqual(self.trackers(v2_row), {'udp://a.example:1/announce', 'udp://v2.example:1'})
+        hybrid_row = next(row for row in rows if HYBRID_HASH in row['link'])
+        self.assertIn('[tpb, lime]', hybrid_row['name'])
 
 
 class HashLookups(SearchTest):
@@ -563,7 +661,7 @@ class HashLookups(SearchTest):
         self.assertEqual(len(rows), 2)
         # a lone .torrent-resolved row keeps its .torrent link, so it is found by that
         from_torrent = next(row for row in rows if 'lime-some' in row['link'])
-        self.assertEqual(from_torrent['size'], f'{TORRENT_SIZE} B')
+        self.assertEqual(from_torrent['size'], TORRENT_SIZE)
         rows, _ = self.run_search()
         self.assertEqual(len(rows), 1)
         self.assertTrue(rows[0]['name'].endswith('[tpb] +1 alt'), rows[0]['name'])
@@ -617,6 +715,21 @@ class HashLookups(SearchTest):
         unresolved = next(row for row in rows if 'dht-slow' in row['link'])
         self.assertTrue(1.9 <= unresolved['at'] <= 2.6, unresolved['at'])
         self.assertLess(seconds, 2.7)
+
+    # A second-round row whose lookup is already running is moved to the first round when a
+    # twin arrives: it is held until its hash is known, and as that hash is on screen by then
+    # (the twin was shown at the first showing) the row is dropped instead of shown as a
+    # duplicate. The search ends as soon as the lookup is in, not at max_search_time.
+    def test_running_second_round_lookup_is_held_when_twin_arrives(self):
+        infohash = 'a' * 40
+        self.jackett.download_replies = {'lime-alpha': ('sleep', 3.0, infohash)}
+        self.jackett.add_result('lime', 'public', 'Alpha Movie 2019 1080p WEB-DL', 20, GiB, download_key='lime-alpha', details_url='https://lime/alpha')
+        self.jackett.add_result('tpb', 'public', 'Alpha Movie 2019 1080p WEB-DL', 50, GiB, infohash=infohash, magnet=f'magnet:?xt=urn:btih:{infohash}')
+        self.jackett.search_delays['tpb'] = 1.0
+        rows, seconds = self.run_search(fold_lookalikes=False)
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]['name'].startswith('Alpha Movie 2019 1080p WEB-DL [tpb]'), rows[0]['name'])
+        self.assertLess(seconds, 5.0)
 
     # A fast lookup merges before the first batch; one finishing later for a hash already
     # shown is dropped; one that never finishes keeps the search alive until
@@ -701,6 +814,21 @@ class LookalikeFolding(SearchTest):
         rows, _ = self.run_search(show_results_after=1, fold_lookalikes=False)
         self.assertEqual(len(rows), 11)
         self.assertFalse(any('+1 alt' in row['name'] for row in rows))
+
+    # The MB floor applies from a gibibyte up: 1.1 GiB and 1.2 GiB with the same title fold
+    # (display rounding), 700 MB and 800 MB with the same title are two files and stay two
+    # rows.
+    def test_size_floor_only_from_a_gibibyte(self):
+        add = self.jackett.add_result
+        add('tpb', 'public', 'Big 2018 1080p', 100, int(1.2 * GiB), infohash=fake_hash('big-a'), magnet=f'magnet:?xt=urn:btih:{fake_hash("big-a")}')
+        add('1337x', 'public', 'Big 2018 1080p', 50, int(1.1 * GiB), infohash=fake_hash('big-b'), magnet=f'magnet:?xt=urn:btih:{fake_hash("big-b")}')
+        add('tpb', 'public', 'Small 2018 720p', 100, 800 * 1024 * 1024, infohash=fake_hash('small-a'), magnet=f'magnet:?xt=urn:btih:{fake_hash("small-a")}')
+        add('1337x', 'public', 'Small 2018 720p', 50, 700 * 1024 * 1024, infohash=fake_hash('small-b'), magnet=f'magnet:?xt=urn:btih:{fake_hash("small-b")}')
+        rows, _ = self.run_search(show_results_after=1)
+        names = [row['name'] for row in rows]
+        self.assertEqual(len(rows), 3, names)
+        self.assertIn('Big 2018 1080p [tpb] +1 alt', names)
+        self.assertEqual(sum('Small 2018 720p' in name for name in names), 2)
 
 
 if __name__ == '__main__':

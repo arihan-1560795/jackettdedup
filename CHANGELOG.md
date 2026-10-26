@@ -1,6 +1,19 @@
 # Changelog
 
-The version is the `# VERSION:` line at the top of `jackettdedup.py`; qBittorrent reads it to offer updates, so it moves with every change to the plugin.
+The version is the `#VERSION:` line at the top of `jackettdedup.py`; qBittorrent reads it to offer updates, so it moves with every change to the plugin.
+
+## 2.10 - 2026-10-26
+
+- The plugin identifies itself to qBittorrent as Jackett's address with a trailing slash. qBittorrent tells plugins apart by their address, enabled or not, and routed this plugin's rows and `.torrent` downloads to whichever of the two Jackett plugins it found first; the two addresses now never match. Requests still go to the address without the slash.
+- `.torrent` downloads no longer go through the proxy qBittorrent passed in when the link is on the Jackett host, which a proxy elsewhere cannot reach. The proxy is used only for a link on another host, as the official plugin does since 4.14.
+- A second-round row whose lookup is already running is moved to the first round when a twin arrives, so it is held until its hash is known instead of shown next to its twin.
+- The main loop reads whether every site has answered before it sorts new rows into lookups; rows arriving in between could be declared done without a lookup.
+- `size_tolerance_mb` applies only to sizes of 1 GiB and more; below that the fraction alone decides, so 700 MB and 800 MB with the same title are no longer folded as one file.
+- A merged row counts as private, and is never folded, when any of its copies is private, not only when the best-seeded one is.
+- BitTorrent v2: a v2-only torrent, which has no v1 infohash, is keyed by its v2 hash (`urn:btmh`), from a magnet or a looked-up `.torrent`, merges with other v2-only copies and gets a `urn:btmh` magnet; hybrids keep their v1 hash as before.
+- Licence stated as GPL-2.0 throughout, the licence of the official plugin this one borrows from; the LICENSE file now carries the GPLv2 text, and the plugin a GPL notice.
+- README: a `|` in a title shows as a space (qBittorrent's printer), not as it should; a Known limitations and future work section; corrections (step 1.5, Jackett idles as a service, `url` needs a restart, the optional log).
+- Housekeeping: `#VERSION:` written without the space (qBittorrent reads 15 bytes of that line); a dead redirect branch and four linter pragmas removed; comments on when settings load and on SOCKS proxies corrected; the test printer mirrors qBittorrent 5.1's; seven new tests.
 
 ## 2.9 - 2026-10-25
 
