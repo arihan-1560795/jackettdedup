@@ -8,7 +8,8 @@ TL;DR- A search plugin for qBittorrent. It merges Jackett's duplicate search res
 
 ELI5- searching a torrent means checking across TPB, 1337x, BtDigg, etc. With qBittorrent's built-in Jackett plugin (setup guide below), all these sites are searched within qBittorrent itself and put in one list. But, if the same torrent was uploaded to five sites, you get five rows for the same thing. My plugin collapses these 5 results into one row and pools the sites' trackers into one link so you find more peers- this makes searching easier and your downloads faster. It also hides (can toggle off) torrents with matching title+size but different infohash with fewer seeders. These are different torrents that can't be merged (usually a re-upload with minor changes); the best-seeded one is kept and the rest are hidden behind a `+N alt` marker. [Details](#details) below.
 
-![The same search with the official Jackett plugin (top) and jackettdedup (bottom)](docs/images/1_before-after-plugin.png)
+<img src="docs/images/1_before-after-plugin.png" width="700" alt="The same search with the official Jackett plugin (top) and jackettdedup (bottom)">
+
 
 ## Contents
 
@@ -44,7 +45,7 @@ Jackett is an open source program that searches multiple torrent sites for qBitt
 4. Click **Add indexer** and add the sites you want (1). Each site gets a Test button (2); a red one is broken on Jackett's side (site down, Cloudflare, your ISP or VPN blocking it), consider disabling or deleting them.
 5. Copy the **API Key** from the top right (3).
 
-![The Jackett dashboard annotated on where to add indexers, how to test an added index, and where to copy the API key from](docs/images/2_jackett-dashboard.png)
+<img src="docs/images/2_jackett-dashboard.png" width="700" alt="The Jackett dashboard annotated on where to add indexers, how to test an added index, and where to copy the API key from">
 
 
 ### 2. qBittorrent
@@ -56,7 +57,7 @@ Jackett is an open source program that searches multiple torrent sites for qBitt
 https://raw.githubusercontent.com/qbittorrent/search-plugins/master/nova3/engines/jackett.py
 ```
 
-![Installing a search plugin in qBittorrent: the numbers are referred to in steps 2 and 4](docs/images/3_install-search-plugin.png)
+<img src="docs/images/3_install-search-plugin.png" width="1000" alt="Installing a search plugin in qBittorrent: the numbers are referred to in steps 2 and 4">
 
 
 ### 3. Setup Jackett API key
@@ -70,17 +71,22 @@ macOS: `~/Library/Application Support/qBittorrent/nova3/engines/`;
 
 2. Replace `YOUR_API_KEY_HERE` with the key from Step 1.5 and save. 
 
-![Add your API key to the jackett.json file](docs/images/4_jackett-json.png)
+<img src="docs/images/4_jackett-json.png" width="500" alt="Add your API key to the jackett.json file">
 
 3. Search for something in qBittorrent's Search tab. Results mean Jackett is set up. A single row reading `Jackett: api key error` means the key wasn't saved; a `connection error` means Jackett isn't running (check the tray icon). Some sites return nothing or fail depending on your ISP, VPN, or the site not playing nice with Jackett (anecdotally, 1337x). That is normal, and it is between Jackett and the site.
 
 ### 4. Setup my search deduper
 
-1. Download `jackettdedup.py` from this repo.
-2. qBittorrent -> `Search` Tab -> `Search Plugins` -> right-click `Jackett` -> untick `Enabled`. Disable it, don't uninstall it.  
-3. `Search Plugins` -> `Install a new one` -> `Local File` -> Pick `jackettdedup.py`
-4. Search again. Results appear within about 20 seconds; slow sites add theirs after that. If you add more sites to Jackett (http://127.0.0.1:9117), they are picked up automatically.
-![Jackett disabled, jackettdedup enabled](docs/images/5_jackettdedup-enabled.png)
+1. qBittorrent -> `Search` Tab -> `Search plugins...` -> right-click `Jackett` -> untick `Enabled`. Disable it, don't uninstall it.
+2. `Search plugins...` -> **Install a new one** (4) **→ Web link** (5) and paste
+```
+https://raw.githubusercontent.com/arihan-1560795/jackettdedup/main/jackettdedup.py
+```
+3. Search again. Results appear within about 20 seconds; slow sites add theirs after that. If you add more sites to Jackett (http://127.0.0.1:9117), they are picked up automatically.
+
+<img src="docs/images/5_jackettdedup-enabled.png" width="500" alt="Jackett disabled, jackettdedup enabled">
+
+To update later, install the same link again; qBittorrent takes it when the version is newer.
 
 ## Settings
 Everything is in `jackettdedup.json`. It is read at the start of every search, so edits need no restart, except `url` (see [Known limitations](#known-limitations-and-future-work)). To tweak (`Win + R`):
