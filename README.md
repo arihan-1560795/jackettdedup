@@ -29,7 +29,7 @@ ELI5- searching a torrent means checking across TPB, 1337x, BtDigg, etc. With qB
 - [Known limitations and future work](#known-limitations-and-future-work)
 - [Tests](#tests)
 - [Credits and license](#credits-and-license)
-- [Support](#support)
+- [Support Me](#support-me)
 
 ## Install
 
@@ -196,10 +196,12 @@ Offline; a local web server plays the part of Jackett.
 
 The plugin replaces the official Jackett plugin rather than running on top of it: qBittorrent runs this file, which talks to Jackett itself. The parts that talk to Jackett and qBittorrent (API calls, category ids, error row, proxy handling) follow the official `jackett.py` by Diego de las Heras and contributors, from [qbittorrent/search-plugins](https://github.com/qbittorrent/search-plugins); the merging is new. GPL-2.0, like the plugin it borrows from.
 
-## Support
+## Support Me
 
 If you'd like to support me: 
  - Venmo: Arihan-Jalan
  - BuyMeACoffee: https://buymeacoffee.com/arihan
  - Paypal: https://paypal.me/arihanjalan
  - GPay: jalanarihan@oksbi
+ - Bitcoin (BTC): `3BaYfFLqto7DYLPNqUdFz1dyb6TRzpYAsq`
+ - Ethereum (ETH only, on Ethereum, Base, or Arbitrum network): `0x021E886FF93Bb364C09b5f789EA445835431812b`
