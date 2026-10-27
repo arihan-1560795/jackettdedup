@@ -2,6 +2,10 @@
 
 The version is the `#VERSION:` line at the top of `jackettdedup.py`; qBittorrent reads it to offer updates, so it moves with every change to the plugin.
 
+## 2.12 - 2026-10-27
+
+- Wording only: the file header and the `use_private_or_public_tracker` note say which trackers each policy announces to; `public` never involves the private account.
+
 ## 2.11 - 2026-10-27
 
 - `prefer_torrent_for_private` is replaced by `use_private_or_public_tracker` (`public`, `private`, `both`, `highest`; default `public`): which link a row shared by private and public sites gets. Before, the best-seeded copy decided, and a public winner pooled the private site's tracker into the magnet by accident. `public` and `private` never mix the two sides; `both` and `highest` can announce a private-flagged torrent to public trackers, which private trackers forbid.

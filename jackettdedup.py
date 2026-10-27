@@ -1,4 +1,4 @@
-#VERSION: 2.11
+#VERSION: 2.12
 # AUTHORS: Arihan Jalan
 # CREDITS: the parts that talk to Jackett and qBittorrent (API calls, category ids, error
 #          row, User-Agent, proxy handling) follow jackett.py 4.14 by Diego de las Heras
@@ -22,8 +22,9 @@
 # When searching with this plugin, it:
 #   1. Searches every site Jackett is set up with, all in parallel.
 #   2. Merges rows with the same infohash (the id of a torrent's contents) into one row:
-#      the trackers of every site go into one magnet link, the highest seed count is shown
-#      and a "[TPB, 1337x +2]" suffix names the sites.
+#      the public sites' trackers go into one magnet link (a private site's copy as
+#      use_private_or_public_tracker says), the highest seed count is shown and a
+#      "[TPB, 1337x +2]" suffix names the sites.
 #   3. Some sites (1337x, LimeTorrents, ...) report no infohash. When such a row looks like
 #      a row from another site (similar title and size), its infohash is fetched: the row's
 #      download link on Jackett returns a magnet or a .torrent file, and both contain it.
@@ -174,7 +175,9 @@ _DEFAULTS: Dict[str, Any] = {
     # since the flag sits inside the hashed part; qBittorrent then turns DHT and peer
     # exchange off for it, and announcing it to public trackers breaks the private
     # tracker's rules. "both" does that for such a torrent, and "highest" does when the
-    # public copy wins. "public" and "private" never mix the two sides.
+    # public copy wins. "public" and "private" never mix the two sides: "private"
+    # announces only to the private tracker, "public" only to the public site's trackers,
+    # with your private account never involved.
     # Anything else counts as public.
     'use_private_or_public_tracker': 'public',
 
