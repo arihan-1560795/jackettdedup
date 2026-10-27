@@ -349,12 +349,15 @@ class HashHelpers(unittest.TestCase):
         self.assertEqual(self.plugin._title_words('Name [2018, США, комедия] Dub', strip_patterns), ('name', '2018', 'сша', 'комедия', 'dub'))
 
     # Trackers come from `announce` and every tier of `announce-list`, deduped, in order;
-    # the size from info.length, or the sum of info.files; a non-torrent decodes to None.
+    # the size from info.length, the sum of info.files, or a v2 file tree, folders included;
+    # a non-torrent decodes to None.
     def test_trackers_and_size_from_torrent(self):
         torrent = self.plugin._torrent_dict(TORRENT_FILE)
         self.assertEqual(self.plugin._trackers_from_torrent(torrent), ['udp://tr.example:6969', 'udp://tier2.example:1'])
         self.assertEqual(self.plugin._size_from_torrent(torrent), TORRENT_SIZE)
         self.assertEqual(self.plugin._size_from_torrent(self.plugin._torrent_dict(MULTI_FILE_TORRENT)), 15)
+        self.assertEqual(self.plugin._size_from_torrent(self.plugin._torrent_dict(V2_FILE)), 4321)
+        self.assertEqual(self.plugin._size_from_file_tree({b'pack': {b'a.mkv': {b'': {b'length': 10}}, b'b.srt': {b'': {b'length': 5}}}}), 15)
         self.assertIsNone(self.plugin._torrent_dict(b'<html>nope</html>'))
         self.assertIsNone(self.plugin._torrent_dict(bencode([1, 2])))
 
@@ -384,12 +387,15 @@ class Settings(SearchTest):
     # A settings file from an older version: settings that no longer exist are dropped and
     # new ones added with their default; a quoted number still works as a number.
     def test_file_from_older_version_is_updated(self):
-        plugin = load_plugin(self.folder, {'api_key': 'K', 'hold_for_lookups': 20, 'lookup_size_tolerance': 0.07, 'show_results_after': '15'})
+        plugin = load_plugin(self.folder, {'api_key': 'K', 'hold_for_lookups': 20, 'lookup_size_tolerance': 0.07, 'show_results_after': '15',
+                                           'prefer_torrent_for_private': True})
         with open(os.path.join(self.folder, 'jackettdedup.json')) as settings_file:
             settings = json.load(settings_file)
         self.assertNotIn('hold_for_lookups', settings)
         self.assertNotIn('lookup_size_tolerance', settings)
+        self.assertNotIn('prefer_torrent_for_private', settings)
         self.assertEqual(settings['size_tolerance'], 0.05)
+        self.assertEqual(settings['use_private_or_public_tracker'], 'public')
         self.assertEqual(plugin.jackettdedup().cfg.show_results_after, 15)
 
     # An unset API key gives one error row, like the official plugin.
@@ -550,15 +556,77 @@ class HashMerging(SearchTest):
         self.assertTrue(any(row['name'].startswith('Line one Line two [tpb]') for row in rows))
         self.assertTrue(all(row['engine_url'] == self.jackett.url + '/' for row in rows))
 
-    # When the best-seeded copy is on a semi-private tracker, the row links to its .torrent
-    # (passkey) instead of a magnet.
-    def test_private_best_source_keeps_torrent_link(self):
+    # One torrent on a public site and on a semi-private one. The private magnet's tracker
+    # carries a sentinel passkey, so the merged link shows which side went into it.
+    #   private_seeds: the semi-private copy's seed count (the public copy has 900)
+    #   private_magnet: whether the semi-private site gives a magnet at all
+    def add_mixed_results(self, private_seeds=10, private_magnet=True):
         infohash = 'b' * 40
-        self.jackett.add_result('rutracker', 'semi-private', 'Russian Dub 1080p', 900, 4 * GiB, infohash=infohash, magnet=f'magnet:?xt=urn:btih:{infohash}')
-        self.jackett.add_result('tpb', 'public', 'Russian Dub 1080p', 10, 4 * GiB, infohash=infohash, magnet=f'magnet:?xt=urn:btih:{infohash}')
-        rows, _ = self.run_search()
+        self.jackett.add_result('tpb', 'public', 'Russian Dub 1080p', 900, 4 * GiB, infohash=infohash,
+                                magnet=f'magnet:?xt=urn:btih:{infohash}&tr=udp://pub.example:1/announce')
+        self.jackett.add_result('rutracker', 'semi-private', 'Russian Dub 1080p', private_seeds, 4 * GiB, infohash=infohash,
+                                magnet=f'magnet:?xt=urn:btih:{infohash}&tr=https://priv.example/PASSKEY123/announce' if private_magnet else None,
+                                download_key='rutracker-dub')
+
+    # The merged row of the mixed group: one row, both sites named, the public copy's 900 seeds.
+    def mixed_row(self, **settings):
+        rows, _ = self.run_search(**settings)
         self.assertEqual(len(rows), 1)
+        self.assertIn('[tpb, rutracker]', rows[0]['name'])
+        self.assertEqual(rows[0]['seeds'], 900)
+        return rows[0]
+
+    # public, the default: a magnet with the public trackers only; the passkey stays out.
+    def test_mixed_link_default_is_public(self):
+        self.add_mixed_results()
+        row = self.mixed_row()
+        self.assertEqual(self.trackers(row), {'udp://pub.example:1/announce'})
+        self.assertNotIn('PASSKEY123', row['link'])
+
+    # both: one magnet with the private and the public trackers.
+    def test_mixed_link_both(self):
+        self.add_mixed_results()
+        row = self.mixed_row(use_private_or_public_tracker='both')
+        self.assertEqual(self.trackers(row), {'udp://pub.example:1/announce', 'https://priv.example/PASSKEY123/announce'})
+
+    # both, but the private site gave no magnet: its .torrent.
+    def test_mixed_link_both_without_private_magnet(self):
+        self.add_mixed_results(private_magnet=False)
+        row = self.mixed_row(use_private_or_public_tracker='both')
+        self.assertTrue(row['link'].startswith(self.jackett.url + '/dl/rutracker/'), row['link'])
+
+    # private: the private site's .torrent, whatever the seed counts.
+    def test_mixed_link_private(self):
+        self.add_mixed_results()
+        row = self.mixed_row(use_private_or_public_tracker='private')
+        self.assertTrue(row['link'].startswith(self.jackett.url + '/dl/rutracker/'), row['link'])
+
+    # public, set explicitly: the same.
+    def test_mixed_link_public(self):
+        self.add_mixed_results()
+        row = self.mixed_row(use_private_or_public_tracker='public')
+        self.assertEqual(self.trackers(row), {'udp://pub.example:1/announce'})
+        self.assertNotIn('PASSKEY123', row['link'])
+
+    # highest with the public copy ahead: the public magnet only.
+    def test_mixed_link_highest(self):
+        self.add_mixed_results()
+        row = self.mixed_row(use_private_or_public_tracker='highest')
+        self.assertEqual(self.trackers(row), {'udp://pub.example:1/announce'})
+
+    # highest with the private copy ahead: its .torrent.
+    def test_mixed_link_highest_private_ahead(self):
+        self.add_mixed_results(private_seeds=5000)
+        rows, _ = self.run_search(use_private_or_public_tracker='highest')
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['seeds'], 5000)
         self.assertTrue(rows[0]['link'].startswith(self.jackett.url + '/dl/rutracker/'), rows[0]['link'])
+
+    # A value that is none of the four counts as public.
+    def test_mixed_link_unknown_value_is_public(self):
+        self.add_mixed_results()
+        row = self.mixed_row(use_private_or_public_tracker='nonsense')
+        self.assertEqual(self.trackers(row), {'udp://pub.example:1/announce'})
 
     # A private copy merged under a better-seeded public copy keeps the merged row private:
     # it is never folded behind a lookalike and never hides one.
@@ -574,12 +642,13 @@ class HashMerging(SearchTest):
 
     # A v2-only torrent (no v1 hash) on two indexers, one as a urn:btmh magnet and one as a
     # .torrent reached by a lookup, becomes one row with a urn:btmh magnet carrying both
-    # sites' trackers. A hybrid .torrent reached by a lookup merges by its v1 hash as usual.
+    # sites' trackers; neither site reported a size, so the row's size comes from the v2
+    # file. A hybrid .torrent reached by a lookup merges by its v1 hash as usual.
     def test_v2_only_copies_merge(self):
         v2_hex = V2_KEY[3:]
-        self.jackett.add_result('tpb', 'public', 'V2 Only Release 2026', 40, 4321, magnet=f'magnet:?xt=urn:btmh:1220{v2_hex}&tr=udp://a.example:1/announce')
+        self.jackett.add_result('tpb', 'public', 'V2 Only Release 2026', 40, None, magnet=f'magnet:?xt=urn:btmh:1220{v2_hex}&tr=udp://a.example:1/announce')
         self.jackett.download_replies = {'lime-v2': ('torrent', V2_FILE), 'lime-hybrid': ('torrent', HYBRID_FILE)}
-        self.jackett.add_result('lime', 'public', 'V2 Only Release 2026', 20, 4321, download_key='lime-v2', details_url='https://lime/v2')
+        self.jackett.add_result('lime', 'public', 'V2 Only Release 2026', 20, None, download_key='lime-v2', details_url='https://lime/v2')
         self.jackett.add_result('tpb', 'public', 'Some File mkv', 50, TORRENT_SIZE, infohash=HYBRID_HASH, magnet=f'magnet:?xt=urn:btih:{HYBRID_HASH}')
         self.jackett.add_result('lime', 'public', 'Some File mkv', 10, TORRENT_SIZE, download_key='lime-hybrid', details_url='https://lime/hybrid')
         rows, _ = self.run_search(fold_lookalikes=False)
@@ -588,6 +657,7 @@ class HashMerging(SearchTest):
         self.assertTrue(v2_row['link'].startswith(f'magnet:?xt=urn:btmh:1220{v2_hex}'), v2_row['link'])
         self.assertIn('[tpb, lime]', v2_row['name'])
         self.assertEqual(self.trackers(v2_row), {'udp://a.example:1/announce', 'udp://v2.example:1'})
+        self.assertEqual(v2_row['size'], 4321)
         hybrid_row = next(row for row in rows if HYBRID_HASH in row['link'])
         self.assertIn('[tpb, lime]', hybrid_row['name'])
 

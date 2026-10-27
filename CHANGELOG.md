@@ -2,6 +2,12 @@
 
 The version is the `#VERSION:` line at the top of `jackettdedup.py`; qBittorrent reads it to offer updates, so it moves with every change to the plugin.
 
+## 2.11 - 2026-10-27
+
+- `prefer_torrent_for_private` is replaced by `use_private_or_public_tracker` (`public`, `private`, `both`, `highest`; default `public`): which link a row shared by private and public sites gets. Before, the best-seeded copy decided, and a public winner pooled the private site's tracker into the magnet by accident. `public` and `private` never mix the two sides; `both` and `highest` can announce a private-flagged torrent to public trackers, which private trackers forbid.
+- A v2-only `.torrent` supplies a missing size, as a v1 one does.
+- README: the Merging paragraph says which link a merged row gets; a settings-table row for the new setting. Seven new tests, one replaced.
+
 ## 2.10 - 2026-10-26
 
 - The plugin identifies itself to qBittorrent as Jackett's address with a trailing slash. qBittorrent tells plugins apart by their address, enabled or not, and routed this plugin's rows and `.torrent` downloads to whichever of the two Jackett plugins it found first; the two addresses now never match. Requests still go to the address without the slash.

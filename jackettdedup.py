@@ -1,4 +1,4 @@
-#VERSION: 2.10
+#VERSION: 2.11
 # AUTHORS: Arihan Jalan
 # CREDITS: the parts that talk to Jackett and qBittorrent (API calls, category ids, error
 #          row, User-Agent, proxy handling) follow jackett.py 4.14 by Diego de las Heras
@@ -66,7 +66,10 @@
 #                           groups that are ready
 #   _merged_row             builds the one result row for a group of rows with the same
 #                           hash: title, seed count, site suffix, link
-#   _merged_magnet          builds that row's magnet link: the hash plus every site's trackers
+#   _merged_link            picks that row's link: the public copies' pooled magnet, a
+#                           private copy's .torrent, or both in one magnet, as
+#                           use_private_or_public_tracker says
+#   _merged_magnet          builds a pooled magnet link: the hash plus the given copies' trackers
 #   _fold_lookalikes        hides rows with the same title and size as a better-seeded row
 #                           ("+N alt")
 #   _show_result            prints one row to qBittorrent
@@ -154,9 +157,26 @@ _DEFAULTS: Dict[str, Any] = {
     # "[TPB, 1337x] Title" instead of "Title [TPB, 1337x]". Handy when sorting by name.
     'indexers_before_title': False,
 
-    # When the best-seeded copy is on a private tracker, link its .torrent (carries your
-    # passkey, counts toward your ratio) instead of a magnet.
-    'prefer_torrent_for_private': True,
+    # A torrent found on both private (or semi-private) and public sites: which link the
+    # merged row gets. Private sites never have their hashes looked up; this only decides
+    # the link of a row they share with public sites. A row with public copies only gets
+    # the pooled public magnet; a row with private copies only links the best-seeded one's
+    # .torrent file.
+    #   public    a magnet with the public trackers only; the private copy adds its seed
+    #             count and site name, nothing else. No ratio credit on the private site.
+    #   private   the private site's .torrent file: carries your passkey, counts toward
+    #             your ratio, and follows the tracker's rules whatever the torrent is.
+    #   both      one magnet with the private site's trackers and the public ones; when
+    #             the private site gives no magnet, its .torrent file instead.
+    #   highest   whichever copy has the most seeders decides, and only that side is used:
+    #             its .torrent when private, a public magnet otherwise.
+    # Mind the private flag: a torrent carrying it stays flagged wherever it is reposted,
+    # since the flag sits inside the hashed part; qBittorrent then turns DHT and peer
+    # exchange off for it, and announcing it to public trackers breaks the private
+    # tracker's rules. "both" does that for such a torrent, and "highest" does when the
+    # public copy wins. "public" and "private" never mix the two sides.
+    # Anything else counts as public.
+    'use_private_or_public_tracker': 'public',
 
     # ---- timing, in seconds ----------------------------------------------------------
     # Sites answer and hash lookups finish in the background. qBittorrent lets a plugin add
@@ -591,8 +611,8 @@ def _trackers_from_torrent(torrent: Dict[bytes, Any]) -> List[str]:
 
 
 # Reads the total size of a torrent's files, for a row whose site reported no size. A
-# single-file torrent has info.length; a multi-file one lists info.files, each with a
-# length.
+# single-file v1 torrent has info.length; a multi-file one lists info.files, each with a
+# length; a v2-only torrent has neither and lists its files in info.`file tree` instead.
 #   torrent: from _torrent_dict
 #   returns: bytes; 0 when the torrent has no sizes
 def _size_from_torrent(torrent: Dict[bytes, Any]) -> int:
@@ -602,9 +622,30 @@ def _size_from_torrent(torrent: Dict[bytes, Any]) -> int:
     if isinstance(info.get(b'length'), int):
         return max(0, info[b'length'])
     files = info.get(b'files')
-    if not isinstance(files, list):
-        return 0
-    return sum(entry[b'length'] for entry in files if isinstance(entry, dict) and isinstance(entry.get(b'length'), int))
+    if isinstance(files, list):
+        return sum(entry[b'length'] for entry in files if isinstance(entry, dict) and isinstance(entry.get(b'length'), int))
+    tree = info.get(b'file tree')
+    return _size_from_file_tree(tree) if isinstance(tree, dict) else 0
+
+
+# Adds up the file lengths in a v2 `file tree`: a dict of names, where a folder is another
+# such dict and a file is a dict whose b'' entry holds its length, nested to any depth.
+#   example: {b'pack': {b'a.mkv': {b'': {b'length': 10}}, b'b.srt': {b'': {b'length': 5}}}}
+#            -> 15
+#   returns: bytes
+def _size_from_file_tree(tree: Dict[bytes, Any]) -> int:
+    total = 0
+    for entry in tree.values():
+        if not isinstance(entry, dict):
+            continue
+        leaf = entry.get(b'')
+        # a file: the b'' entry carries its length; anything else is a folder to descend
+        if isinstance(leaf, dict):
+            if isinstance(leaf.get(b'length'), int):
+                total += max(0, leaf[b'length'])
+        else:
+            total += _size_from_file_tree(entry)
+    return total
 
 
 # ============================================================================= TITLES
@@ -780,6 +821,10 @@ class jackettdedup:
     def __init__(self) -> None:
         # every setting, as cfg.show_results_after and so on
         self.cfg = SimpleNamespace(**{key: _setting(key) for key in _DEFAULTS})
+        # the link policy is one of four words; anything else is read as the default
+        self.cfg.use_private_or_public_tracker = str(self.cfg.use_private_or_public_tracker).strip().lower()
+        if self.cfg.use_private_or_public_tracker not in ('both', 'private', 'public', 'highest'):
+            self.cfg.use_private_or_public_tracker = _DEFAULTS['use_private_or_public_tracker']
         self._strip_patterns = []
         for pattern in self.cfg.fold_strip_patterns:
             try:
@@ -1289,12 +1334,7 @@ class jackettdedup:
         cfg = self.cfg
         rows = sorted(rows, key=lambda row: row['seeds'], reverse=True)
         best = rows[0]
-        # the link: the best copy's .torrent when it is on a private tracker (passkey,
-        # ratio), else one magnet carrying every copy's trackers, else whatever link exists
-        if cfg.prefer_torrent_for_private and best['private'] and best['link']:
-            link = best['link']
-        else:
-            link = self._merged_magnet(best['infohash'], rows) or next((row['link'] for row in rows if row['link']), '')
+        link = self._merged_link(best['infohash'], rows)
         # the best copy's size, or any copy's when the best reports none
         size = best['size'] if best['size'] > 0 else next((row['size'] for row in rows if row['size'] > 0), -1)
         pub_dates = [row['pub_date'] for row in rows if row['pub_date'] != -1]
@@ -1325,11 +1365,43 @@ class jackettdedup:
         # when its best-seeded copy is public
         return {'result': result, 'seeds': best['seeds'], 'size': size, 'private': any(row['private'] for row in rows), 'words': best['words']}
 
-    # Builds one magnet link for a group: the hash, the first display name, every copy's
-    # trackers (from magnets and from looked-up .torrent files, deduped) and any other
-    # magnet parameters, such as web seeds. More trackers = more peers found.
-    #   infohash: the group's key, a v1 hash or "v2:" + a v2 hash; '' for a hash-less row
+    # Picks the one link for a group. The public copies pool into one magnet
+    # (_merged_magnet); a private copy's .torrent link carries the user's passkey and
+    # counts toward their ratio, so a row shared by private and public sites follows
+    # use_private_or_public_tracker (see the setting). Lock must be held.
+    #   infohash: the group's key; '' for a hash-less row
     #   rows: the group, best-seeded first
+    #   returns: a magnet, a Jackett download link, or '' when no copy has either
+    def _merged_link(self, infohash: str, rows: List[Dict[str, Any]]) -> str:
+        private_rows = [row for row in rows if row['private']]
+        public_rows = [row for row in rows if not row['private']]
+        # the private side's link: the best-seeded private copy's .torrent, or its magnet
+        # when the site gave no .torrent
+        private_link = next((row['link'] or row['magnet'] for row in private_rows if row['link'] or row['magnet']), '')
+        # the public side's: one magnet pooling the public copies, else the best public .torrent
+        public_link = self._merged_magnet(infohash, public_rows) or next((row['link'] for row in public_rows if row['link']), '')
+        if not private_rows:
+            return public_link
+        if not public_rows:
+            return private_link
+        policy = self.cfg.use_private_or_public_tracker
+        if policy == 'private':
+            return private_link or public_link
+        if policy == 'public':
+            return public_link or private_link
+        if policy == 'highest':
+            return (private_link or public_link) if rows[0]['private'] else (public_link or private_link)
+        # both: every copy's trackers in one magnet when a private site gave a magnet; else
+        # the private .torrent (see the setting's note on the private flag)
+        if any(row['magnet'] for row in private_rows):
+            return self._merged_magnet(infohash, rows) or private_link or public_link
+        return private_link or public_link
+
+    # Builds one magnet link for the given copies: the hash, the first display name, every
+    # copy's trackers (from magnets and from looked-up .torrent files, deduped) and any
+    # other magnet parameters, such as web seeds. More trackers = more peers found.
+    #   infohash: the group's key, a v1 hash or "v2:" + a v2 hash; '' for a hash-less row
+    #   rows: the copies to pool, best-seeded first
     #   returns: the magnet; '' when no copy has one (a lone .torrent-resolved row keeps
     #            its .torrent link); the first magnet unchanged when the hash is unknown
     def _merged_magnet(self, infohash: str, rows: List[Dict[str, Any]]) -> str:

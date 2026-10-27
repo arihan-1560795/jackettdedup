@@ -36,7 +36,7 @@ Already running Jackett with qBittorrent's official Jackett plugin, and getting 
 
 ### 1. Jackett
 
-Jackett is an open source program that searches multiple torrent sites for qBittorrent. It spins up when it searches, but is otherwise idle.
+Jackett is an open source program that searches multiple torrent sites for qBittorrent. It runs as a background service and is idle (spins down) between searches.
 
 1. Download and run the installer from [Jackett releases](https://github.com/Jackett/Jackett/releases).
 2. Tick **Install as a Windows Service**, so Jackett starts with Windows; searches fail whenever it isn't running.
@@ -97,13 +97,14 @@ Every setting is explained above its default in `jackettdedup.py`. The ones most
 | `lookup_remaining_hashes` | `true` | After the likely duplicates, look up every other hash-less row too while waiting for `show_results_after`. `false` looks up likely duplicates only. |
 | `search_retries` | `3` | Extra attempts when a site's search fails inside Jackett; such failures often clear on the second try. |
 | `fold_lookalikes` | `true` | Hide re-uploads behind `+N alt`. `false` shows every distinct torrent. |
+| `use_private_or_public_tracker` | `public` | A torrent on both a private and a public site: `public` links a magnet with the public trackers only, `private` the private site's `.torrent` (passkey, ratio), `both` pools every tracker into one magnet, `highest` lets the best-seeded copy decide. `both` and `highest` can announce a private-flagged torrent to public trackers, which private trackers forbid. |
 | `debug_log` | `false` | Write `jackettdedup.log` next to the plugin: what each search did, and why any row couldn't be merged. |
 
 ## Details
 
 ### Merging
 
-The infohash is a hash of the torrent's file list, sizes and piece checksums, so two rows with the same infohash are the same. Merging them loses nothing, and it increases the number of seeders you connect to by pooling together swarms from different sites. The merged row takes the highest seed count any site reported and a magnet link with every site's trackers.
+The infohash is a hash of the torrent's file list, sizes and piece checksums, so two rows with the same infohash are the same. Merging them loses nothing, and it increases the number of seeders you connect to by pooling together swarms from different sites. The merged row takes the highest seed count any site reported and one link for all of them: a magnet pooling the public sites' trackers, or a private site's `.torrent` as `use_private_or_public_tracker` says.
 
 qBittorrent lets a plugin add rows but never change or remove one, so a row is built from the copies in hand when it is shown. A copy that arrives later (a slow site, a lookup that finished after the deadline) is dropped rather than shown twice; it cannot raise the seed count of a row already on screen. Results wait `show_results_after` seconds so that most copies are in by then.
 
@@ -154,7 +155,7 @@ Things the official Jackett plugin leaves alone, handled here:
 - qBittorrent only lets a plugin add rows. We can't change a row once it's on screen; late copies are dropped vs. shown twice.
 - Doesn't search anything Jackett doesn't. No new sites, and no fixing a site that is red in Jackett.
 - Only touches Jackett's results. Rows from other plugins are shown by qBittorrent as they come, duplicates included.
-- Never looks up hashes on a private or semi-private tracker; those rows are shown as they arrive and are never folded.
+- Never looks up hashes on a private or semi-private tracker; those rows are shown as they arrive and are never folded. Which link a row shared by private and public sites gets is set by `use_private_or_public_tracker`.
 - Keeps nothing between searches: no cache, no history, no files written other than its settings and, when `debug_log` is on, the log.
 - Doesn't catch every duplicate. A copy that arrives after its row was shown, a lookup that fails or runs past `max_search_time`, or a site that reports neither a hash nor a download link, stays as its own row.
 - Jackett only; Prowlarr has a different API and is not supported.
